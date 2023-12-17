@@ -38,6 +38,10 @@ const createWindow = () => {
 
     return printers;
   });
+
+  ipcMain.handle('print-ticket', (event, data, options) =>
+    PosPrinter.print(data, options)
+  )
 };
 
 // This method will be called when Electron has finished
