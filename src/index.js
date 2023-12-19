@@ -22,7 +22,7 @@ const createWindow = () => {
 
   //if it is, load the app from the localhost
   //otherwise load the app from the server
-  const loadUrl = isDev ? 'http://localhost:5173' : 'https://tpv.asoft.es';
+  const loadUrl = isDev ? 'http://localhost:5173' : 'https://apptpv.asoft.es';
 
   // and load the app.
   mainWindow.loadURL(loadUrl);
