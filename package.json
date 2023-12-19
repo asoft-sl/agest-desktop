@@ -1,8 +1,8 @@
 {
-  "name": "desktop app",
-  "productName": "desktop app",
+  "name": "asoft_tpv",
+  "productName": "Asoft TPV",
   "version": "1.0.0",
-  "description": "My Electron application description",
+  "description": "Programa TPV",
   "main": "src/index.js",
   "scripts": {
     "start": "electron-forge start",
@@ -13,8 +13,8 @@
   },
   "keywords": [],
   "author": {
-    "name": "Abraham Leiro Fernandez",
-    "email": "abrahamleirofernandez@gmail.com"
+    "name": "ASoft SL",
+    "email": "info@asoft.es"
   },
   "license": "MIT",
   "dependencies": {
