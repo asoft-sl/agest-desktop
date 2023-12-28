@@ -20,12 +20,8 @@ const createWindow = () => {
     },
   });
 
-  //detect if the app is running in development mode
-  const isDev = require('electron-is-dev');
-
-  //if it is, load the app from the localhost
-  //otherwise load the app from the server
-  const loadUrl = isDev ? 'http://localhost:5175' : 'https://apptpv.asoft.es';
+  //load the url
+  const loadUrl = 'https://apptpv.asoft.es';
 
   // and load the app.
   mainWindow.loadURL(loadUrl);
