@@ -12,6 +12,8 @@ const createWindow = () => {
   const mainWindow = new BrowserWindow({
     width: 800,
     height: 600,
+    //hide the menu bar
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
     },
@@ -22,14 +24,14 @@ const createWindow = () => {
 
   //if it is, load the app from the localhost
   //otherwise load the app from the server
-  const loadUrl = isDev ? 'http://localhost:5173' : 'https://apptpv.asoft.es';
+  const loadUrl = isDev ? 'http://localhost:5175' : 'https://apptpv.asoft.es';
 
   // and load the app.
   mainWindow.loadURL(loadUrl);
 
 
   // Open the DevTools.
-  mainWindow.webContents.openDevTools();
+  //mainWindow.webContents.openDevTools();
 
   //get the printers list
   ipcMain.handle('get-printers', async () => {
