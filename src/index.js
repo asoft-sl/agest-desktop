@@ -14,6 +14,7 @@ const createWindow = () => {
     height: 600,
     //hide the menu bar
     autoHideMenuBar: true,
+    fullscreen: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       partition: 'persist:tpv',
@@ -21,7 +22,7 @@ const createWindow = () => {
   });
 
   //load the url
-  const loadUrl = 'https://apptpv.asoft.es';
+  const loadUrl = 'http://localhost:5173';
 
   // and load the app.
   mainWindow.loadURL(loadUrl);
@@ -99,3 +100,4 @@ app.on('activate', () => {
 //   .catch((error) => {
 //     console.error(error);
 //   });
+
