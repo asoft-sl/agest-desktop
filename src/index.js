@@ -22,7 +22,7 @@ const createWindow = () => {
   });
 
   //load the url
-  const loadUrl = 'http://localhost:5173';
+  const loadUrl = 'https://apptpv.asoft.es';
 
   // and load the app.
   mainWindow.loadURL(loadUrl);
