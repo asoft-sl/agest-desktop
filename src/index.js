@@ -4,6 +4,34 @@ const fs = require('fs');
 
 const isDev = !app.isPackaged;
 
+// Buffer circular de logs del proceso principal (últimas 500 líneas)
+const MAIN_LOG_MAX = 500;
+const mainLogBuffer = [];
+const mainLogListeners = new Set();
+
+function pushMainLog(level, message, ...args) {
+  const entry = {
+    t: Date.now(),
+    level,
+    message: typeof message === 'string' ? message : String(message),
+    args: args.map(a => (typeof a === 'string' ? a : JSON.stringify(a, null, 2))),
+  };
+  mainLogBuffer.push(entry);
+  if (mainLogBuffer.length > MAIN_LOG_MAX) mainLogBuffer.shift();
+  // Notificar a listeners (UI en renderer)
+  for (const cb of mainLogListeners) {
+    try { cb(entry); } catch {}
+  }
+  // También a consola nativa
+  console[level](`[${new Date(entry.t).toISOString()}]`, message, ...args);
+}
+
+// Interceptar console.* del main para que todo pase por el buffer
+const originalConsole = { log: console.log, warn: console.warn, error: console.error };
+console.log = (...a) => pushMainLog('log', ...a);
+console.warn = (...a) => pushMainLog('warn', ...a);
+console.error = (...a) => pushMainLog('error', ...a);
+
 let PosPrinter;
 try {
   PosPrinter = require("electron-pos-printer").PosPrinter;
@@ -200,6 +228,19 @@ const createWindow = () => {
       // rollo se le pide ese, que no va a sustituir por otro.
       const pageSize = await resolvePageSize(options, activeWindow(mainWindow));
       return PosPrinter.print(data, { ...options, pageSize });
+    });
+
+    // Logs del proceso principal para la UI de Ajustes
+    ipcMain.handle('main-log:get', () => mainLogBuffer.slice(-200));
+
+    ipcMain.handle('main-log:subscribe', (_event, rendererId) => {
+      // El renderer manda su ID; le devolvemos un handler para cancelar
+      const cb = (entry) => {
+        _event.sender.send('main-log:entry', entry);
+      };
+      mainLogListeners.add(cb);
+      // Devolver función de cleanup (el renderer la llamará al desmontar)
+      return () => mainLogListeners.delete(cb);
     });
   }
 };
