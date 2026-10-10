@@ -7,27 +7,51 @@ const isDev = !app.isPackaged;
 // Buffer circular de logs del proceso principal (últimas 500 líneas)
 const MAIN_LOG_MAX = 500;
 const mainLogBuffer = [];
-const mainLogListeners = new Set();
+// webContents.id -> callback que reenvía cada entry a ese renderer
+const mainLogListeners = new Map();
+
+function stringifyArg(arg) {
+  if (typeof arg === 'string') return arg;
+  try {
+    const json = JSON.stringify(arg, null, 2);
+    return json === undefined ? String(arg) : json;
+  } catch {
+    // Estructuras circulares y objetos raros: se cae a String antes que romper
+    // el log (y con él, la impresión).
+    try {
+      return String(arg);
+    } catch {
+      return '[no serializable]';
+    }
+  }
+}
 
 function pushMainLog(level, message, ...args) {
   const entry = {
     t: Date.now(),
     level,
     message: typeof message === 'string' ? message : String(message),
-    args: args.map(a => (typeof a === 'string' ? a : JSON.stringify(a, null, 2))),
+    args: args.map(stringifyArg),
   };
   mainLogBuffer.push(entry);
   if (mainLogBuffer.length > MAIN_LOG_MAX) mainLogBuffer.shift();
   // Notificar a listeners (UI en renderer)
-  for (const cb of mainLogListeners) {
+  for (const cb of mainLogListeners.values()) {
     try { cb(entry); } catch {}
   }
-  // También a consola nativa
-  console[level](`[${new Date(entry.t).toISOString()}]`, message, ...args);
+  // También a consola nativa. OJO: tiene que ser la consola original, guardada
+  // antes de interceptarla. Si se llama a console[level] aquí, esa llamada vuelve
+  // a entrar en pushMainLog y se recursa hasta el "Maximum call stack size
+  // exceeded", que es el error que veía el TPV en producción.
+  (nativeConsole[level] || nativeConsole.log)(
+    `[${new Date(entry.t).toISOString()}]`,
+    message,
+    ...args,
+  );
 }
 
 // Interceptar console.* del main para que todo pase por el buffer
-const originalConsole = { log: console.log, warn: console.warn, error: console.error };
+const nativeConsole = { log: console.log, warn: console.warn, error: console.error };
 console.log = (...a) => pushMainLog('log', ...a);
 console.warn = (...a) => pushMainLog('warn', ...a);
 console.error = (...a) => pushMainLog('error', ...a);
@@ -233,14 +257,19 @@ const createWindow = () => {
     // Logs del proceso principal para la UI de Ajustes
     ipcMain.handle('main-log:get', () => mainLogBuffer.slice(-200));
 
-    ipcMain.handle('main-log:subscribe', (_event, rendererId) => {
-      // El renderer manda su ID; le devolvemos un handler para cancelar
-      const cb = (entry) => {
-        _event.sender.send('main-log:entry', entry);
-      };
-      mainLogListeners.add(cb);
-      // Devolver función de cleanup (el renderer la llamará al desmontar)
-      return () => mainLogListeners.delete(cb);
+    ipcMain.handle('main-log:subscribe', (event) => {
+      const sender = event.sender;
+      const cb = (entry) => sender.send('main-log:entry', entry);
+      mainLogListeners.set(sender.id, cb);
+      // Si el renderer se cierra sin desuscribirse (recarga, cierre de
+      // pestaña), el callback se queda colgado: se limpia al destruirse.
+      sender.once('destroyed', () => mainLogListeners.delete(sender.id));
+      return true;
+    });
+
+    ipcMain.handle('main-log:unsubscribe', (event) => {
+      mainLogListeners.delete(event.sender.id);
+      return true;
     });
   }
 };

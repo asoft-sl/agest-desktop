@@ -10,14 +10,30 @@ contextBridge.exposeInMainWorld('electron', {
     // Logs del proceso principal
     mainLog: {
       get: () => ipcRenderer.invoke('main-log:get'),
-      subscribe: async (cb) => {
-        // cb recibe cada entrada nueva
-        const cleanup = await ipcRenderer.invoke('main-log:subscribe');
-        ipcRenderer.on('main-log:entry', (_e, entry) => cb(entry));
-        return async () => {
-          await cleanup();
-          ipcRenderer.off('main-log:entry', (_e, entry) => cb(entry));
-        };
+      subscribe: (cb) => {
+        // cb es el callback del renderer. Nos suscribimos en main y
+        // reenviamos cada entry vía ipcRenderer.on. Usamos una referencia
+        // estable para que el off funcione al limpiar.
+        const listener = (_e, entry) => cb(entry);
+        ipcRenderer.on('main-log:entry', listener);
+        // Pedimos al main que empiece a enviar a este renderer. La
+        // desuscripción no puede volver como función: Electron clona el valor
+        // de retorno del invoke y una función no se puede clonar. Se pide con
+        // otro invoke.
+        return ipcRenderer
+          .invoke('main-log:subscribe')
+          .then(() => {
+            return async () => {
+              ipcRenderer.off('main-log:entry', listener);
+              await ipcRenderer.invoke('main-log:unsubscribe');
+            };
+          })
+          .catch((err) => {
+            // No se pudo suscribir: fuera el listener local, que si no se
+            // acumula uno por montaje del componente.
+            ipcRenderer.off('main-log:entry', listener);
+            throw err;
+          });
       },
     },
 });
