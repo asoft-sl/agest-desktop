@@ -23,6 +23,105 @@ try {
 const PROD_URL = 'https://apptpv.asoft.es';
 const DEV_URL = 'http://localhost:5174';
 
+// ---------------------------------------------------------------------------
+// El papel de la impresora
+//
+// electron-pos-printer manda el ancho del rollo ('80mm' / '58mm') y Electron lo
+// traduce al tamaño real de página, así que el ancho sí llega a la impresora.
+// Lo que falla es el alto: cuando `pageSize` es un texto, la librería pone de
+// alto la altura del contenido del ticket (post-printer.ts), una medida que no
+// corresponde a ningún formulario del driver. Los drivers de rollo no tienen
+// ese formulario, así que lo sustituyen por su papel por defecto —normalmente
+// A4— y el ticket sale encogido sobre el rollo: texto pequeño y centrado, con
+// márgenes a los lados. Lo mismo pasa al imprimir en directo; con el diálogo se
+// ve bien porque el usuario elige a mano el rollo.
+//
+// Por eso, antes de imprimir se pregunta a la impresora qué formularios
+// declara y, si alguno es del ancho del rollo, se pide ese formulario tal cual
+// (mismo ancho y mismo alto), que es papel que el driver conoce y no va a
+// sustituir. Si la impresora no anuncia ninguno —en macOS y Linux no los
+// anuncian— se manda el rollo como siempre y decide el driver.
+// ---------------------------------------------------------------------------
+
+// 1 px = 264.5833 micras, la conversión que hace electron-pos-printer.
+const MICRONS_PER_PIXEL = 264.5833;
+
+// Los drivers miden el rollo un poco justo (72, 76, 78 mm...) y no siempre
+// cuadran al milímetro, así que se acepta el formulario que más se le parezca.
+const MICRONS_TOLERANCE = 2000;
+
+/** Ancho del rollo en micras a partir del `pageSize` del TPV ('80mm', '58mm'). */
+function rollMicrons(pageSize) {
+  if (typeof pageSize !== 'string') return null;
+
+  const width = parseFloat(pageSize);
+  return Number.isFinite(width) ? Math.ceil(width * 1000) : null;
+}
+
+/**
+ * Formularios que declara el driver. En Windows vienen en el JSON de
+ * `printer-capabilities` de cada impresora (`{ paperSizes: [{ name, size: {
+ * width_microns, height_microns }, isDefault }] }`); en macOS y Linux no
+ * existen y se devuelve una lista vacía.
+ */
+function driverPaperSizes(printer) {
+  const capabilities = printer?.options?.['printer-capabilities'];
+  if (typeof capabilities !== 'string') return [];
+
+  try {
+    return JSON.parse(capabilities).paperSizes || [];
+  } catch (e) {
+    console.warn('printer-capabilities ilegible:', e.message);
+    return [];
+  }
+}
+
+/**
+ * Devuelve el `pageSize` que se le pasa a electron-pos-printer: el formulario
+ * del rollo que declara la impresora, o el que venga si no declara ninguno.
+ *
+ * El objeto va en píxeles porque electron-pos-printer lo convierte a micras con
+ * la misma constante, así que el ancho y el alto que salen son los del
+ * formulario. Además, al ser un objeto la librería deja de medir el contenido
+ * para poner ese alto como alto de página.
+ */
+async function resolvePageSize(options, win) {
+  const width = rollMicrons(options.pageSize);
+  if (!width || !options.printerName) return options.pageSize;
+
+  const printers = await win.webContents.getPrintersAsync();
+  const printer = printers.find((p) => p.name === options.printerName);
+  const sizes = driverPaperSizes(printer);
+
+  // Primero el que el driver tiene por defecto y luego el que coincida, por si
+  // el ancho del rollo aparece en más de un formulario.
+  const paper = sizes
+    .filter((s) => s.size?.width_microns != null)
+    .sort((a, b) => Number(b.isDefault) - Number(a.isDefault))
+    .find((s) => Math.abs(s.size.width_microns - width) <= MICRONS_TOLERANCE);
+
+  if (!paper?.size?.height_microns) {
+    // No hay formulario del rollo: se manda el ancho como siempre y decide el
+    // driver. El log dice si la impresora es que no los anuncia (macOS y Linux)
+    // o si es que los tiene, pero ninguno del ancho pedido.
+    console.log(
+      `[impresion] ${options.printerName} no declara un formulario de ${width / 1000}mm;`,
+      `formularios: ${sizes.map((s) => s.name).join(', ') || 'ninguno'}`,
+    );
+    return options.pageSize;
+  }
+
+  console.log(
+    `[impresion] ${options.printerName}: ${options.pageSize} -> ${paper.name}`,
+    `(${paper.size.width_microns / 1000}x${paper.size.height_microns / 1000}mm)`,
+  );
+
+  return {
+    width: paper.size.width_microns / MICRONS_PER_PIXEL,
+    height: paper.size.height_microns / MICRONS_PER_PIXEL,
+  };
+}
+
 const createWindow = () => {
   const mainWindow = new BrowserWindow({
     width: 800,
@@ -71,9 +170,13 @@ const createWindow = () => {
       return win.webContents.getPrintersAsync();
     });
 
-    ipcMain.handle('print-ticket', (_event, data, options) => {
+    ipcMain.handle('print-ticket', async (_event, data, options) => {
       if (!PosPrinter) throw new Error('Printer module not available');
-      return PosPrinter.print(data, options);
+
+      // El papel lo decide la impresora: si declara un formulario del ancho del
+      // rollo se le pide ese, que no va a sustituir por otro.
+      const pageSize = await resolvePageSize(options, win);
+      return PosPrinter.print(data, { ...options, pageSize });
     });
   }
 };

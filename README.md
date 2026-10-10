@@ -99,9 +99,15 @@ const printers = await window.electron.getPrinters();
 await window.electron.printTicket(data, options);
 ```
 
+## El papel de la impresora
+
+El TPV manda en `options.pageSize` el ancho del rollo tal cual (`'80mm'`, `'58mm'`) y Electron lo traduce al tamaño real de pagina, asi que el ancho llega a la impresora. Lo que no llega bien es el alto: cuando `pageSize` es un texto, `electron-pos-printer` pone de alto la altura del contenido del ticket, una medida que no corresponde a ningun formulario del driver. Los drivers de rollo sustituyen ese papel por su propio (normalmente A4) y el ticket sale encogido y centrado sobre el rollo.
+
+Por eso, antes de imprimir, `resolvePageSize()` pregunta a la impresora que formularios declara —en Windows vienen en el `printer-capabilities` que devuelve `getPrinters()`— y si alguno es del ancho del rollo, le pide ese formulario tal cual, que es papel que el driver no va a sustituir. Si la impresora no anuncia ninguno (en macOS y Linux no los anuncian) se manda el rollo como siempre y decide el driver.
+
 ## Tecnologias
 
-- [Electron](https://www.electronjs.org/) 28
+- [Electron](https://www.electronjs.org/) 40
 - [Electron Forge](https://www.electronforge.io/) 7
 - [electron-pos-printer](https://github.com/nicholowen/electron-pos-printer)
 
