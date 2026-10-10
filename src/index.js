@@ -50,6 +50,10 @@ const MICRONS_PER_PIXEL = 264.5833;
 // cuadran al milímetro, así que se acepta el formulario que más se le parezca.
 const MICRONS_TOLERANCE = 2000;
 
+// Tope del alto de página: 1,5 m, de sobra para un rollo y por debajo del
+// límite de Chromium (200 pulgadas) y del tamaño de ventana que aguanta Windows.
+const MAX_PAGE_MICROS = 1500000;
+
 /** Ancho del rollo en micras a partir del `pageSize` del TPV ('80mm', '58mm'). */
 function rollMicrons(pageSize) {
   if (typeof pageSize !== 'string') return null;
@@ -77,6 +81,26 @@ function driverPaperSizes(printer) {
 }
 
 /**
+ * Chromium solo admite páginas de 353 micras (0,35 mm) a 200 pulgadas, y el
+ * alto del formulario es el que acaba mandando la librería como alto de la
+ * página: un rollo continuo declarado como "10 m" daría una ventana de 38000
+ * píxeles que Windows no crea. Un formulario fuera de rango no sirve, así que se
+ * descarta y se sigue con el ancho del rollo como hasta ahora.
+ */
+function usableForm(paper) {
+  if (!paper?.size) return null;
+
+  const width = Number(paper.size.width_microns);
+  const height = Number(paper.size.height_microns);
+
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+  if (width < 353 || height < 353) return null;
+  if (height > MAX_PAGE_MICROS) return null;
+
+  return paper;
+}
+
+/**
  * Devuelve el `pageSize` que se le pasa a electron-pos-printer: el formulario
  * del rollo que declara la impresora, o el que venga si no declara ninguno.
  *
@@ -86,8 +110,8 @@ function driverPaperSizes(printer) {
  * para poner ese alto como alto de página.
  */
 async function resolvePageSize(options, win) {
-  const width = rollMicrons(options.pageSize);
-  if (!width || !options.printerName) return options.pageSize;
+  const width = rollMicrons(options?.pageSize);
+  if (!width || !options?.printerName) return options?.pageSize;
 
   const printers = await win.webContents.getPrintersAsync();
   const printer = printers.find((p) => p.name === options.printerName);
@@ -96,11 +120,12 @@ async function resolvePageSize(options, win) {
   // Primero el que el driver tiene por defecto y luego el que coincida, por si
   // el ancho del rollo aparece en más de un formulario.
   const paper = sizes
-    .filter((s) => s.size?.width_microns != null)
+    .filter((s) => Number.isFinite(Number(s.size?.width_microns)))
     .sort((a, b) => Number(b.isDefault) - Number(a.isDefault))
-    .find((s) => Math.abs(s.size.width_microns - width) <= MICRONS_TOLERANCE);
+    .find((s) => Math.abs(Number(s.size.width_microns) - width) <= MICRONS_TOLERANCE);
 
-  if (!paper?.size?.height_microns) {
+  const page = usableForm(paper);
+  if (!page) {
     // No hay formulario del rollo: se manda el ancho como siempre y decide el
     // driver. El log dice si la impresora es que no los anuncia (macOS y Linux)
     // o si es que los tiene, pero ninguno del ancho pedido.
@@ -113,12 +138,12 @@ async function resolvePageSize(options, win) {
 
   console.log(
     `[impresion] ${options.printerName}: ${options.pageSize} -> ${paper.name}`,
-    `(${paper.size.width_microns / 1000}x${paper.size.height_microns / 1000}mm)`,
+    `(${Number(paper.size.width_microns) / 1000}x${Number(paper.size.height_microns) / 1000}mm)`,
   );
 
   return {
-    width: paper.size.width_microns / MICRONS_PER_PIXEL,
-    height: paper.size.height_microns / MICRONS_PER_PIXEL,
+    width: Number(paper.size.width_microns) / MICRONS_PER_PIXEL,
+    height: Number(paper.size.height_microns) / MICRONS_PER_PIXEL,
   };
 }
 
@@ -165,9 +190,7 @@ const createWindow = () => {
   // Register IPC handlers only once
   if (!ipcMain.listenerCount('get-printers')) {
     ipcMain.handle('get-printers', async () => {
-      const focusedWindow = BrowserWindow.getFocusedWindow();
-      const win = focusedWindow || mainWindow;
-      return win.webContents.getPrintersAsync();
+      return activeWindow(mainWindow).webContents.getPrintersAsync();
     });
 
     ipcMain.handle('print-ticket', async (_event, data, options) => {
@@ -175,11 +198,20 @@ const createWindow = () => {
 
       // El papel lo decide la impresora: si declara un formulario del ancho del
       // rollo se le pide ese, que no va a sustituir por otro.
-      const pageSize = await resolvePageSize(options, win);
+      const pageSize = await resolvePageSize(options, activeWindow(mainWindow));
       return PosPrinter.print(data, { ...options, pageSize });
     });
   }
 };
+
+/**
+ * La ventana desde la que se consulta el sistema de impresión. La enfocada es
+ * la del TPV, que es la que tiene el preload y la que llama; la principal es el
+ * respaldo para cuando no haya ninguna enfocada.
+ */
+function activeWindow(mainWindow) {
+  return BrowserWindow.getFocusedWindow() || mainWindow;
+}
 
 function loadErrorPage(win, url, errorMessage) {
   const html = `<!DOCTYPE html>
