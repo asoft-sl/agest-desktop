@@ -1,0 +1,95 @@
+name: Release
+
+# Al publicar una etiqueta v1.0, v1.1, v2.0... compila el instalador de
+# Windows y abre la release en GitHub con el .exe adjunto.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Compilar instalador de Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      # El nombre del instalable lleva la versión del package.json, así que se
+      # pone la de la etiqueta antes de empaquetar.
+      - name: Aplicar la versión de la etiqueta
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          npm version --no-git-tag-version --allow-same-version $version
+
+      - name: Empaquetar
+        run: npm run make
+
+      - name: Comprobar que se ha generado el instalador
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -Path out/make -Recurse -Filter *.exe
+          if (-not $setup) {
+            Write-Error "No se ha generado ningún instalador en out/make"
+            exit 1
+          }
+          $setup | ForEach-Object { Write-Host "Instalador: $($_.Name)" }
+
+      - name: Subir el artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: out/make/**/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publicar la release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Descargar el artefacto
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: dist
+
+      - name: Crear la release en GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            Instalador de Windows de **Asoft TPV**.
+
+            1. Descarga el `.exe` adjunto.
+            2. Ejecútalo e instala: se actualiza sobre la versión anterior sin
+               perder la configuración.
+            3. Arranca de nuevo la aplicación.
+
+            Desde el TPV también se puede descargar en **Ajustes > General >
+            Aplicación de escritorio**.
+          files: dist/*.exe
+          fail_on_unmatched_files: true
+          generate_release_notes: true
