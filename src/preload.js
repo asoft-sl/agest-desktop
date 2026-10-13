@@ -7,6 +7,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('electron', {
     getPrinters: () => ipcRenderer.invoke('get-printers'),
     printTicket: (data, options) => ipcRenderer.invoke('print-ticket', data, options),
+    // Recarga la aplicación desde la página de error de conexión.
+    retryLoad: () => ipcRenderer.send('retry-load'),
     // Logs del proceso principal
     mainLog: {
       get: () => ipcRenderer.invoke('main-log:get'),

@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { pathToFileURL } = require('url');
 
 const isDev = !app.isPackaged;
 
@@ -74,6 +75,69 @@ try {
 
 const PROD_URL = 'https://apptpv.asoft.es';
 const DEV_URL = 'http://localhost:5174';
+
+// ---------------------------------------------------------------------------
+// Sin caché
+//
+// El TPV se actualiza solo, sin instalar nada: si el navegador guarda la
+// respuesta del servidor, una versión nueva desplegada no llega al appareil
+// hasta que expire el TTL, y un TPV puede quedarse horas con la versión vieja.
+// Además el HTML se carga desde una URL de producción y no de un fichero, así
+// que la caché de disco de Chromium es justo la que lo retiene.
+//
+// Se corta por dos vías, porque cada una tapa un agujero de la otra:
+// `setCacheSize(0)` vacía y desactiva la caché de red de la sesión (HTML, JS,
+// CSS, imágenes, XHR), y el `onHeadersReceived` reescribe las cabeceras de
+// respuesta para quitarle a Chromium cualquierLifetime que declare el servidor
+// —`Cache-Control`, `Expires`, `ETag`— y forzar la revalidación siempre.
+// Sin lo segundo, un `Cache-Control: max-age=31536000` del servidor manda
+// sobre el tamaño de caché.
+//
+// La cabecera se pone en todas las respuestas de la sesión, incluidas las de
+// terceros, para que ningún recurso (un `.woff2` de una CDN, por ejemplo)
+// sobreviva a un reinicio de la aplicación.
+//
+// Esto no toca el almacenamiento del navegador: `localStorage`, `sessionStorage`,
+// cookies e IndexedDB siguen en la partición `persist:tpv` y persisten como
+// siempre. Lo que se pierde entre arranques son los ficheros cacheados
+// (HTML, JS, CSS, imágenes), que es lo único que tiene que desaparecer.
+// ---------------------------------------------------------------------------
+
+const NO_CACHE_HEADERS = new Set([
+  'cache-control',
+  'pragma',
+  'expires',
+  'etag',
+  'last-modified',
+]);
+
+const NO_CACHE_VALUE = 'no-store, no-cache, must-revalidate, max-age=0';
+
+/** Chromium arranca con la caché de disco a 0; debe fijarse antes de estar listo. */
+app.commandLine.appendSwitch('disk-cache-size', '0');
+
+/** Deja la sesión de la ventana sin caché de red y con respuestas no cacheables. */
+function disableCaching(session) {
+  session.setCacheSize(0);
+  session.clearCache();
+
+  session.webRequest.onHeadersReceived((details, callback) => {
+    const responseHeaders = details.responseHeaders || {};
+
+    // Las cabeceras llegan con el case tal cual lo mandó el servidor
+    // ("Cache-Control", "cache-control", ...), así que se filtran sin
+    // distinguirlas.
+    for (const header of Object.keys(responseHeaders)) {
+      if (NO_CACHE_HEADERS.has(header.toLowerCase())) delete responseHeaders[header];
+    }
+
+    responseHeaders['Cache-Control'] = NO_CACHE_VALUE;
+    responseHeaders['Pragma'] = 'no-cache';
+    responseHeaders['Expires'] = '0';
+
+    callback({ cancel: false, responseHeaders });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // El papel de la impresora
@@ -199,6 +263,27 @@ async function resolvePageSize(options, win) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Errores de carga
+//
+// La ventana se queda en blanco —pantalla blanca, sin mensaje y sin reacción a
+// nada— cuando la carga no "falla" sino que no termina: la red del TPV está
+// caída, el DNS no resuelve, o hay un proxy que acepta la conexión y no contesta
+// nunca. En esos casos no salta ningún error y la aplicación se queda esperando
+// en silencio. Además hay fallos que Electron no considera error de carga, como
+// un 502 de un balanceador o un 504 por el TLS caducado, que llegan como una
+// respuesta válida y pintan la página de error del propio Chromium (o nada).
+//
+// Por eso la carga se vigila por cuatro vías y, en cuanto una falla, se sustituye
+// la ventana por una página de error propia que dice qué pasó y deja reintentar.
+// ---------------------------------------------------------------------------
+
+/** Sin cargar nada en ese tiempo, se da la carga por fallida. */
+const PAGE_LOAD_TIMEOUT = 20000;
+
+/** Margen que se le da a la app para pintar antes de darla por en blanco. */
+const BLANK_GRACE_MS = 2500;
+
 const createWindow = () => {
   const mainWindow = new BrowserWindow({
     width: 800,
@@ -210,30 +295,112 @@ const createWindow = () => {
     },
   });
 
+  disableCaching(mainWindow.webContents.session);
+
   const loadUrl = isDev ? DEV_URL : PROD_URL;
 
-  // Track if we already showed an error page to avoid loops
+  // Evita mostrar dos veces la página de error (un fallo de carga dispara varios
+  // de estos avisos).
   let showingError = false;
+  let loadTimer = null;
+  let blankTimer = null;
 
-  mainWindow.webContents.on('did-finish-load', () => {
-    mainWindow.setFullScreen(true);
-  });
+  const clearTimers = () => {
+    clearTimeout(loadTimer);
+    clearTimeout(blankTimer);
+  };
 
-  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
-    console.error('Page failed to load:', errorCode, errorDescription);
-    if (errorCode === -3) return;
-    if (showingError) return;
+  /** Sustituye la ventana por la página de error. `code` va al log y a la página. */
+  const showError = (code, message) => {
+    if (showingError || mainWindow.isDestroyed()) return;
     showingError = true;
-    loadErrorPage(mainWindow, validatedURL || loadUrl, errorDescription);
-  });
+    clearTimers();
+    console.error(`[carga] ${loadUrl} -> ${code}: ${message}`);
+    loadErrorPage(mainWindow, loadUrl, `${message} (${code})`);
+  };
 
-  mainWindow.loadURL(loadUrl).catch((err) => {
-    console.error('Failed to load URL:', err.message);
-    if (!showingError) {
-      showingError = true;
-      loadErrorPage(mainWindow, loadUrl, err.message);
+  // Reloj de la carga: es lo único que cubre el caso en el que la conexión se
+  // queda colgada sin llegar a fallar nunca.
+  const armLoadTimer = () => {
+    clearTimeout(loadTimer);
+    loadTimer = setTimeout(() => {
+      showError('TIMEOUT', `El servidor no respondió en ${PAGE_LOAD_TIMEOUT / 1000} s`);
+    }, PAGE_LOAD_TIMEOUT);
+  };
+
+  // Un HTTP >= 400 no cuenta como carga fallida: la respuesta llega y se
+  // muestra la página de error del propio Chromium, que no explica nada. Se
+  // sustituye por la nuestra, que sí.
+  mainWindow.webContents.session.webRequest.onCompleted((details) => {
+    if (showingError) return;
+    if (details.resourceType !== 'main') return;
+    if (details.statusCode >= 400) {
+      showError(`HTTP_${details.statusCode}`, `El servidor respondió ${details.statusCode}`);
     }
   });
+
+  mainWindow.webContents.on('did-start-loading', armLoadTimer);
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    clearTimers();
+    // La propia página de error también dispara esto.
+    if (isErrorPage(mainWindow)) return;
+    // La app cargó (también puede ser después de pulsar Reintentar), así que un
+    // error anterior deja de valer y este evento ya no pinta de blanco.
+    showingError = false;
+    mainWindow.setFullScreen(true);
+    blankTimer = setTimeout(checkBlank, BLANK_GRACE_MS);
+  });
+
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    // -3 es ERR_ABORTED: una carga cancelada por otra navegación, no un fallo de
+    // conexión. Sin esta comprobación, recargar cancela la carga anterior y el
+    // TPV se corta a sí mismo.
+    if (errorCode === -3) return;
+
+    // Un subframe que falla (un logo, un iframe de un tercero) no deja la app en
+    // blanco, así que no se sustituye la ventana por una página de error.
+    if (!isMainFrame) {
+      console.warn('Fallo en un subframe:', validatedURL, errorCode, errorDescription);
+      return;
+    }
+
+    showError(`ERR_${errorCode}`, errorDescription);
+  });
+
+  /**
+   * Última comprobación: la carga terminó "bien" pero no pintó nada. Pasa cuando
+   * el backend devuelve un 200 con el body vacío o con un error dentro de un
+   * JSON que la app no sabe mostrar, y sin esto la pantalla queda en blanco.
+   */
+  const checkBlank = async () => {
+    if (showingError || mainWindow.isDestroyed()) return;
+    // Puede haber empezado otra navegación durante el margen.
+    if (mainWindow.webContents.isLoading()) return;
+
+    try {
+      const blank = await mainWindow.webContents.executeJavaScript(
+        `(() => {
+          const b = document.body;
+          if (!b) return true;
+          return b.childElementCount === 0 && !b.textContent.trim();
+        })()`,
+      );
+      if (blank) showError('BLANK', 'La página se cargó pero se quedó en blanco');
+    } catch (err) {
+      // No es una página web, o ya se ha navegado: no hay nada que comprobar.
+      console.warn('[carga] no se pudo comprobar la página en blanco:', err.message);
+    }
+  };
+
+  const startLoad = () => {
+    armLoadTimer();
+    return mainWindow.loadURL(loadUrl).catch((err) => {
+      showError('LOAD', err.message);
+    });
+  };
+
+  startLoad();
 
   if (isDev) {
     mainWindow.webContents.openDevTools();
@@ -271,6 +438,16 @@ const createWindow = () => {
       mainLogListeners.delete(event.sender.id);
       return true;
     });
+
+    // Reintentar desde la página de error. Va por IPC y no con `location.href`
+    // para que el main pueda reiniciar la vigilancia de carga: si la app vuelve
+    // a fallar, sin esto el error anterior seguiría en pantalla y la ventana se
+    // quedaría en blanco otra vez.
+    ipcMain.on('retry-load', () => {
+      showingError = false;
+      clearTimers();
+      startLoad();
+    });
   }
 };
 
@@ -283,7 +460,34 @@ function activeWindow(mainWindow) {
   return BrowserWindow.getFocusedWindow() || mainWindow;
 }
 
+/** Ruta del fichero donde se escribe la página de error. */
+function errorPagePath() {
+  return path.join(app.getPath('userData'), 'error.html');
+}
+
+/** Si la ventana está mostrando nuestra página de error en vez de la app. */
+function isErrorPage(win) {
+  try {
+    return win.webContents.getURL() === pathToFileURL(errorPagePath()).href;
+  } catch {
+    return false;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 function loadErrorPage(win, url, errorMessage) {
+  // La URL y el mensaje vienen de la red y de Chromium, así que se escapan
+  // antes de meterse en el HTML.
+  const safeUrl = escapeHtml(url);
+  const safeMessage = escapeHtml(errorMessage);
+
   const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -301,16 +505,28 @@ function loadErrorPage(win, url, errorMessage) {
 </head>
 <body>
   <div class="container">
-    <h1>No se pudo conectar</h1>
-    <p>No se pudo cargar la aplicación desde:<br><strong>${url}</strong></p>
-    <div class="error">${errorMessage}</div>
-    <button onclick="location.reload()">Reintentar</button>
+    <h1>No se pudo cargar el TPV</h1>
+    <p>No se pudo cargar la aplicación desde:<br><strong>${safeUrl}</strong></p>
+    <p>Revisa la conexión de red del equipo y vuelve a intentarlo.</p>
+    <div class="error">${safeMessage}</div>
+    <button id="retry" data-url="${safeUrl}">Reintentar</button>
   </div>
+  <script>
+    document.getElementById('retry').addEventListener('click', function () {
+      // Se avisa al proceso principal, que reinicia la vigilancia de carga: si
+      // la app vuelve a fallar tiene que poder mostrar el error otra vez. Si el
+      // preload no estuviera disponible (y no debería), se navega igualmente.
+      if (window.electron && window.electron.retryLoad) {
+        window.electron.retryLoad();
+      } else {
+        location.href = this.dataset.url;
+      }
+    });
+  </script>
 </body>
 </html>`;
-  const errorFilePath = path.join(app.getPath('userData'), 'error.html');
-  fs.writeFileSync(errorFilePath, html);
-  win.loadFile(errorFilePath);
+  fs.writeFileSync(errorPagePath(), html);
+  win.loadFile(errorPagePath());
 }
 
 app.whenReady().then(createWindow);
