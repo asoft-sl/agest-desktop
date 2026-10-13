@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
@@ -57,6 +57,13 @@ console.log = (...a) => pushMainLog('log', ...a);
 console.warn = (...a) => pushMainLog('warn', ...a);
 console.error = (...a) => pushMainLog('error', ...a);
 
+// Una promesa rechazada sin capturar se queda en la consola de Windows, que en
+// un TPV nadie mira. Se pasa por el log que la UI de Ajustes lee, que es lo
+// único que ayuda a saber qué pasó en una instalación concreta.
+process.on('unhandledRejection', (reason) => {
+  console.error('Promesa rechazada sin capturar en el proceso principal:', reason);
+});
+
 let PosPrinter;
 try {
   PosPrinter = require("electron-pos-printer").PosPrinter;
@@ -73,25 +80,31 @@ try {
   // electron-squirrel-startup not available in dev
 }
 
+// La aplicación es siempre la de producción. No hay forma de apuntarla a otro
+// sitio a propósito: el TPV no se usa en desarrollo, y un `isDev ? ... : ...`
+// en función de `app.isPackaged` ya dejó instalaciones viendo un `localhost` en
+// el que no hay nada, que es una pantalla en blanco sin explicación.
 const PROD_URL = 'https://apptpv.asoft.es';
-const DEV_URL = 'http://localhost:5174';
 
 // ---------------------------------------------------------------------------
 // Sin caché
 //
 // El TPV se actualiza solo, sin instalar nada: si el navegador guarda la
-// respuesta del servidor, una versión nueva desplegada no llega al appareil
-// hasta que expire el TTL, y un TPV puede quedarse horas con la versión vieja.
-// Además el HTML se carga desde una URL de producción y no de un fichero, así
-// que la caché de disco de Chromium es justo la que lo retiene.
+// respuesta del servidor, una versión nueva desplegada no llega al TPV hasta que
+// expire el TTL, y puede quedarse horas con la versión vieja.
 //
-// Se corta por dos vías, porque cada una tapa un agujero de la otra:
-// `setCacheSize(0)` vacía y desactiva la caché de red de la sesión (HTML, JS,
-// CSS, imágenes, XHR), y el `onHeadersReceived` reescribe las cabeceras de
-// respuesta para quitarle a Chromium cualquierLifetime que declare el servidor
-// —`Cache-Control`, `Expires`, `ETag`— y forzar la revalidación siempre.
-// Sin lo segundo, un `Cache-Control: max-age=31536000` del servidor manda
-// sobre el tamaño de caché.
+// La única vía que se usa son las cabeceras de respuesta: `onHeadersReceived`
+// quita las de cualquier tiempo de vida que declare el servidor —`Cache-Control`,
+// `Expires`, `ETag`— y devuelve `no-store` en su lugar, y Chromium no guarda en
+// memoria ni en disco una respuesta marcada así. Así que no depende de que
+// Chromium respete un `max-age` ni del tamaño que le pongamos a la caché.
+//
+// Lo que NO se usa, y es importante: `session.setCacheSize(0)`. Ese método ya no
+// existe en la API de sesión (las 40.6.1 con las que se compila sólo ofrecen
+// `getCacheSize()` y `clearCache()`), así que llamarlo lanzaba un TypeError
+// dentro de createWindow() antes de navegar y dejaba la ventana en blanco para
+// siempre, sin log ni error visible. `clearCache()` sí existe, pero vacía la
+// caché que hubiera: no impide que se escriba otra.
 //
 // La cabecera se pone en todas las respuestas de la sesión, incluidas las de
 // terceros, para que ningún recurso (un `.woff2` de una CDN, por ejemplo)
@@ -113,30 +126,38 @@ const NO_CACHE_HEADERS = new Set([
 
 const NO_CACHE_VALUE = 'no-store, no-cache, must-revalidate, max-age=0';
 
-/** Chromium arranca con la caché de disco a 0; debe fijarse antes de estar listo. */
-app.commandLine.appendSwitch('disk-cache-size', '0');
-
-/** Deja la sesión de la ventana sin caché de red y con respuestas no cacheables. */
+/**
+ * Deja la sesión de la ventana con respuestas no cacheables.
+ *
+ * Todo va dentro de un try/catch a propósito: esto se ejecuta antes de navegar,
+ * así que cualquier excepción aquí deja la ventana en blanco y sin explicación.
+ * Que falle la limpieza de caché no puede ser motivo para que el TPV no arranque.
+ */
 function disableCaching(session) {
-  session.setCacheSize(0);
-  session.clearCache();
+  try {
+    session.clearCache().catch((err) => {
+      console.warn('No se pudo vaciar la caché de la sesión:', err.message);
+    });
 
-  session.webRequest.onHeadersReceived((details, callback) => {
-    const responseHeaders = details.responseHeaders || {};
+    session.webRequest.onHeadersReceived((details, callback) => {
+      const responseHeaders = details.responseHeaders || {};
 
-    // Las cabeceras llegan con el case tal cual lo mandó el servidor
-    // ("Cache-Control", "cache-control", ...), así que se filtran sin
-    // distinguirlas.
-    for (const header of Object.keys(responseHeaders)) {
-      if (NO_CACHE_HEADERS.has(header.toLowerCase())) delete responseHeaders[header];
-    }
+      // Las cabeceras llegan con el case tal cual lo mandó el servidor
+      // ("Cache-Control", "cache-control", ...), así que se filtran sin
+      // distinguirlas.
+      for (const header of Object.keys(responseHeaders)) {
+        if (NO_CACHE_HEADERS.has(header.toLowerCase())) delete responseHeaders[header];
+      }
 
-    responseHeaders['Cache-Control'] = NO_CACHE_VALUE;
-    responseHeaders['Pragma'] = 'no-cache';
-    responseHeaders['Expires'] = '0';
+      responseHeaders['Cache-Control'] = NO_CACHE_VALUE;
+      responseHeaders['Pragma'] = 'no-cache';
+      responseHeaders['Expires'] = '0';
 
-    callback({ cancel: false, responseHeaders });
-  });
+      callback({ cancel: false, responseHeaders });
+    });
+  } catch (err) {
+    console.error('No se pudo desactivar la caché, se sigue con la de por defecto:', err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +318,7 @@ const createWindow = () => {
 
   disableCaching(mainWindow.webContents.session);
 
-  const loadUrl = isDev ? DEV_URL : PROD_URL;
+  const loadUrl = PROD_URL;
 
   // Evita mostrar dos veces la página de error (un fallo de carga dispara varios
   // de estos avisos).
@@ -331,9 +352,13 @@ const createWindow = () => {
   // Un HTTP >= 400 no cuenta como carga fallida: la respuesta llega y se
   // muestra la página de error del propio Chromium, que no explica nada. Se
   // sustituye por la nuestra, que sí.
+  //
+  // El recurso principal se identifica con 'mainFrame', no con 'main': ese
+  // último valor no existe y la comparación nunca cuadraba, así que esta vía
+  // estaba muerta y sólo funcionaba el fallo de carga de más abajo.
   mainWindow.webContents.session.webRequest.onCompleted((details) => {
     if (showingError) return;
-    if (details.resourceType !== 'main') return;
+    if (details.resourceType !== 'mainFrame') return;
     if (details.statusCode >= 400) {
       showError(`HTTP_${details.statusCode}`, `El servidor respondió ${details.statusCode}`);
     }
@@ -370,8 +395,15 @@ const createWindow = () => {
 
   /**
    * Última comprobación: la carga terminó "bien" pero no pintó nada. Pasa cuando
-   * el backend devuelve un 200 con el body vacío o con un error dentro de un
-   * JSON que la app no sabe mostrar, y sin esto la pantalla queda en blanco.
+   * el bundle de la SPA no monta (un error de JavaScript, una versión
+   * incompatible), cuando el backend devuelve un 200 con el body vacío, o cuando
+   * un error viene dentro de un JSON que la app no sabe mostrar.
+   *
+   * No basta con mirar que el body no tenga hijos: el HTML de producción es una
+   * SPA y su body siempre contiene un `<div id="root">` vacío hasta que React
+   * monta, así que ese criterio nunca se cumplía y la comprobación no detectaba
+   * nada. Lo que se mira es si hay algo pintado: texto, o una imagen, un SVG, un
+   * canvas o un vídeo. Un TPV en blanco es lo que sale cuando nada de eso existe.
    */
   const checkBlank = async () => {
     if (showingError || mainWindow.isDestroyed()) return;
@@ -383,7 +415,8 @@ const createWindow = () => {
         `(() => {
           const b = document.body;
           if (!b) return true;
-          return b.childElementCount === 0 && !b.textContent.trim();
+          if (b.textContent.trim()) return false;
+          return !b.querySelector('img, svg, canvas, video, picture, iframe');
         })()`,
       );
       if (blank) showError('BLANK', 'La página se cargó pero se quedó en blanco');
@@ -482,17 +515,26 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
-function loadErrorPage(win, url, errorMessage) {
+/**
+ * Sustituye lo que haya en la ventana por la página de error.
+ *
+ * `heading` y `hint` se personalizan porque no todo lo que llega aquí es un
+ * problema de red: un fallo de la propia aplicación no puede decirle al
+ * usuario que revise su conexión.
+ */
+function loadErrorPage(win, url, errorMessage, { heading, hint } = {}) {
   // La URL y el mensaje vienen de la red y de Chromium, así que se escapan
   // antes de meterse en el HTML.
   const safeUrl = escapeHtml(url);
   const safeMessage = escapeHtml(errorMessage);
+  const safeHeading = escapeHtml(heading || 'No se pudo cargar el TPV');
+  const safeHint = escapeHtml(hint || 'Revisa la conexión de red del equipo y vuelve a intentarlo.');
 
   const html = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Asoft TPV - Error de conexión</title>
+  <title>Asoft TPV - Error</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5; color: #333; }
     .container { text-align: center; max-width: 500px; padding: 40px; }
@@ -505,9 +547,9 @@ function loadErrorPage(win, url, errorMessage) {
 </head>
 <body>
   <div class="container">
-    <h1>No se pudo cargar el TPV</h1>
+    <h1>${safeHeading}</h1>
     <p>No se pudo cargar la aplicación desde:<br><strong>${safeUrl}</strong></p>
-    <p>Revisa la conexión de red del equipo y vuelve a intentarlo.</p>
+    <p>${safeHint}</p>
     <div class="error">${safeMessage}</div>
     <button id="retry" data-url="${safeUrl}">Reintentar</button>
   </div>
@@ -529,7 +571,36 @@ function loadErrorPage(win, url, errorMessage) {
   win.loadFile(errorPagePath());
 }
 
-app.whenReady().then(createWindow);
+/**
+ * Un fallo del proceso principal antes de navegar deja la ventana en blanco y
+ * sin decir nada: eso fue exactamente lo que pasó con una API de sesión que ya
+ * no existía, y ni log ni error visible. Si la aplicación ni siquiera ha
+ * podido arrancar, tiene que verse en pantalla.
+ */
+function showFatalError(err) {
+  const message = err?.stack || err?.message || String(err);
+  console.error('La aplicación no ha podido arrancar:', err);
+
+  const win = BrowserWindow.getAllWindows()[0];
+
+  if (win && !win.isDestroyed()) {
+    try {
+      loadErrorPage(win, PROD_URL, message, {
+        heading: 'No se pudo iniciar el TPV',
+        hint: 'Esto es un fallo de la aplicación instalada, no de la conexión. Reinicia el equipo y, si sigue igual, reinstala el TPV.',
+      });
+      return;
+    } catch (pageErr) {
+      console.error('Tampoco se ha podido mostrar la página de error:', pageErr.message);
+    }
+  }
+
+  dialog.showErrorBox('Asoft TPV', `No se pudo iniciar la aplicación:\n\n${message}`);
+}
+
+app.whenReady()
+  .then(createWindow)
+  .catch(showFatalError);
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
@@ -539,6 +610,6 @@ app.on('window-all-closed', () => {
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow();
+    Promise.resolve().then(createWindow).catch(showFatalError);
   }
 });
