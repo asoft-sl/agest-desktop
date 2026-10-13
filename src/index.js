@@ -297,13 +297,23 @@ async function resolvePageSize(options, win) {
 //
 // Por eso la carga se vigila por cuatro vías y, en cuanto una falla, se sustituye
 // la ventana por una página de error propia que dice qué pasó y deja reintentar.
+//
+// IMPORTANTE: nada de esto puede volver a dispararse con la aplicación ya
+// funcionando. El TPV se queda horas abierto y cada venta, cada navegación y cada
+// cambio de pantalla generan cargas dentro de la SPA; si un temporizador de
+// carga continuara corriendo, a los 20 s de no hacer nada sustituiría un TPV que
+// funciona por una pantalla de error. Ese error es justo el que se veía.
 // ---------------------------------------------------------------------------
 
-/** Sin cargar nada en ese tiempo, se da la carga por fallida. */
+/** Tiempo que puede tardar la carga de arranque sin darse por fallida. */
 const PAGE_LOAD_TIMEOUT = 20000;
 
-/** Margen que se le da a la app para pintar antes de darla por en blanco. */
-const BLANK_GRACE_MS = 2500;
+/**
+ * Margen que se le da a la app para pintar antes de darla por en blanco. Con la
+ * caché desactivada, cada arranque descarga el bundle entero, así que en una red
+ * de tienda lenta pintar no es inmediato.
+ */
+const BLANK_GRACE_MS = 8000;
 
 const createWindow = () => {
   const mainWindow = new BrowserWindow({
@@ -325,6 +335,10 @@ const createWindow = () => {
   let showingError = false;
   let loadTimer = null;
   let blankTimer = null;
+  // Si la carga que vigila el reloj llegó a completarse. Sin esta marca, un
+  // temporizador armado antes del `did-finish-load` seguiría corriendo y acabaría
+  // tumbando la aplicación ya cargada.
+  let loadCompleted = false;
 
   const clearTimers = () => {
     clearTimeout(loadTimer);
@@ -340,11 +354,19 @@ const createWindow = () => {
     loadErrorPage(mainWindow, loadUrl, `${message} (${code})`);
   };
 
-  // Reloj de la carga: es lo único que cubre el caso en el que la conexión se
-  // queda colgada sin llegar a fallar nunca.
+  // Reloj de carga: es lo único que cubre el caso en el que la conexión se queda
+  // colgada sin llegar a fallar nunca.
+  //
+  // Solo se arma para las cargas que pide esta aplicación (el arranque y el
+  // Reintentar). Antes se armaba con `did-start-loading`, que también salta con
+  // las navegaciones internas de la SPA; como esas no emiten `did-finish-load`,
+  // el reloj se quedaba vivo y a los 20 s sustituía un TPV que estaba
+  // funcionando por la pantalla de "el servidor no responde".
   const armLoadTimer = () => {
+    loadCompleted = false;
     clearTimeout(loadTimer);
     loadTimer = setTimeout(() => {
+      if (loadCompleted) return;
       showError('TIMEOUT', `El servidor no respondió en ${PAGE_LOAD_TIMEOUT / 1000} s`);
     }, PAGE_LOAD_TIMEOUT);
   };
@@ -364,9 +386,13 @@ const createWindow = () => {
     }
   });
 
-  mainWindow.webContents.on('did-start-loading', armLoadTimer);
+  // El reloj de carga lo arma `startLoad()`, no este evento. `did-start-loading`
+  // salta con cualquier navegación, incluidas las internas de la SPA y las de
+  // cualquier subframe, y con un TPV abierto durante horas eso disparaba la
+  // pantalla de "el servidor no responde" mientras todo funcionaba.
 
   mainWindow.webContents.on('did-finish-load', () => {
+    loadCompleted = true;
     clearTimers();
     // La propia página de error también dispara esto.
     if (isErrorPage(mainWindow)) return;
@@ -391,6 +417,19 @@ const createWindow = () => {
     }
 
     showError(`ERR_${errorCode}`, errorDescription);
+  });
+
+  // Si el proceso de la página se cae (una excepción sin capturar que tumbe el
+  // renderer, la GPU en un equipo viejo), la ventana se queda en blanco y no hay
+  // ninguna carga que falle: no salta ni did-fail-load ni el reloj. Es el último
+  // hueco por el que se puede quedar en blanco, así que se cubre con la misma
+  // página de error y su botón de Reintentar.
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    // 'clean-exit' es el cierre normal de la aplicación.
+    if (details?.reason === 'clean-exit') return;
+
+    console.error('[carga] el proceso de la página ha terminado:', JSON.stringify(details));
+    showError('RENDER_GONE', `La aplicación se ha cerrado inesperadamente (${details?.reason || 'motivo desconocido'})`);
   });
 
   /**
