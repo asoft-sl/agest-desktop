@@ -71,13 +71,17 @@ try {
   console.error('electron-pos-printer failed to load:', e.message);
 }
 
-// Handle creating/removing shortcuts on Windows when installing/uninstalling.
+// Squirrel lanza este mismo ejecutable con --squirrel-updated (y el resto de
+// eventos) mientras el TPV sigue abierto. electron-squirrel-startup crea el
+// acceso directo y llama a app.quit() cuando acaba: si quitamos aquí, ese
+// trabajo se corta. Lo que no puede pasar es abrir una ventana. Si no, el
+// instalador silencioso plantaría un segundo TPV a pantalla completa encima
+// de la venta.
+let launchedBySquirrel = false;
 try {
-  if (require('electron-squirrel-startup')) {
-    app.quit();
-  }
+  launchedBySquirrel = require('electron-squirrel-startup');
 } catch (e) {
-  // electron-squirrel-startup not available in dev
+  // electron-squirrel-startup no está en desarrollo.
 }
 
 // La aplicación es siempre la de producción. No hay forma de apuntarla a otro
@@ -637,18 +641,42 @@ function showFatalError(err) {
   dialog.showErrorBox('Asoft TPV', `No se pudo iniciar la aplicación:\n\n${message}`);
 }
 
-app.whenReady()
-  .then(createWindow)
-  .catch(showFatalError);
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+// El hijo de Squirrel no pide el cierre: si lo pidiera y esta instancia ya lo
+// tiene, el hijo se cerraría antes de actualizar el acceso directo.
+if (!launchedBySquirrel) {
+  const gotLock = app.requestSingleInstanceLock();
+  if (!gotLock) {
     app.quit();
-  }
-});
+  } else {
+    app.on('second-instance', () => {
+      const win = BrowserWindow.getAllWindows().find((item) => !item.isDestroyed());
+      if (!win) return;
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    });
 
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    Promise.resolve().then(createWindow).catch(showFatalError);
+    app.whenReady()
+      .then(() => {
+        createWindow();
+        try {
+          require('./updater').startUpdater();
+        } catch (err) {
+          console.error('[updater] no se ha podido iniciar:', err);
+        }
+      })
+      .catch(showFatalError);
+
+    app.on('window-all-closed', () => {
+      if (process.platform !== 'darwin') {
+        app.quit();
+      }
+    });
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        Promise.resolve().then(createWindow).catch(showFatalError);
+      }
+    });
   }
-});
+}

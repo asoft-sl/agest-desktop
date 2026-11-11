@@ -9,6 +9,32 @@ contextBridge.exposeInMainWorld('electron', {
     printTicket: (data, options) => ipcRenderer.invoke('print-ticket', data, options),
     // Recarga la aplicación desde la página de error de conexión.
     retryLoad: () => ipcRenderer.send('retry-load'),
+    // Actualización del escritorio. start descarga el instalador a una carpeta
+    // temporal e informa del avance. install ejecuta ese archivo. finish
+    // reinicia cuando la versión nueva ya está aplicada.
+    updater: {
+      getState: () => ipcRenderer.invoke('updater:get-state'),
+      start: () => ipcRenderer.invoke('updater:start'),
+      install: () => ipcRenderer.invoke('updater:install'),
+      finish: () => ipcRenderer.invoke('updater:finish'),
+      check: () => ipcRenderer.invoke('updater:check'),
+      subscribe: (cb) => {
+        const listener = (_event, next) => cb(next);
+        ipcRenderer.on('updater:state', listener);
+        return ipcRenderer
+          .invoke('updater:subscribe')
+          .then(() => {
+            return async () => {
+              ipcRenderer.off('updater:state', listener);
+              await ipcRenderer.invoke('updater:unsubscribe');
+            };
+          })
+          .catch((err) => {
+            ipcRenderer.off('updater:state', listener);
+            throw err;
+          });
+      },
+    },
     // Logs del proceso principal
     mainLog: {
       get: () => ipcRenderer.invoke('main-log:get'),
